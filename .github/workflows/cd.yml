@@ -22,12 +22,45 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition byte8-assignment-task \
+            --region ${{ secrets.AWS_REGION }} \
+            --query "taskDefinition" \
+            --output json > task-def.json
+
+      - name: Update task definition with new image
+        id: render-task-def
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          NEW_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          jq --arg IMAGE "$NEW_IMAGE" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-def.json > new-task-def.json
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --region ${{ secrets.AWS_REGION }} \
+            --cli-input-json file://new-task-def.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          echo "task_def_arn=$NEW_TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
+
       - name: Deploy to ECS staging
         run: |
           aws ecs update-service \
             --cluster byte8-assignment-cluster \
             --service byte8-assignment-service \
-            --force-new-deployment \
+            --task-definition ${{ steps.render-task-def.outputs.task_def_arn }} \
             --region ${{ secrets.AWS_REGION }}
 
       - name: Wait for service stability
@@ -44,7 +77,7 @@ jobs:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
           payload: |
-            text: "⚠️ Staging deployment FAILED for ${{ github.repository }} on commit ${{ github.sha }}."
+            text: "⚠️ Staging deployment FAILED for ${{ github.repository }} on commit ${{ github.event.workflow_run.head_sha }}."
 
   deploy-production:
     needs: deploy-staging
@@ -69,6 +102,13 @@ jobs:
             --force-new-deployment \
             --region ${{ secrets.AWS_REGION }}
 
+      - name: Wait for service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster byte8-assignment-cluster \
+            --services byte8-assignment-service \
+            --region ${{ secrets.AWS_REGION }}
+
       - name: Notify Slack on failure
         if: failure()
         uses: slackapi/slack-github-action@v2.0.0
@@ -76,4 +116,4 @@ jobs:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
           payload: |
-            text: "❌ Production deployment FAILED for ${{ github.repository }} on commit ${{ github.sha }}. Check the Actions tab for details."
+            text: "❌ Production deployment FAILED for ${{ github.repository }} on commit ${{ github.event.workflow_run.head_sha }}. Check the Actions tab for details."
